@@ -46,7 +46,18 @@ class PatchTool(QWidget):
         self.load_ini_btn = QPushButton("Load .ini File")
 
         for btn in [self.load_rom_btn, self.load_ini_btn]:
-            btn.setStyleSheet("padding: 8px; font-size: 14px; border-radius: 6px;")
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3C3C3C;
+                    color: #FFFFFF;
+                    padding: 8px;
+                    font-size: 14px;
+                    border-radius: 6px;
+                }
+                QPushButton:hover {
+                    background-color: #505050;
+                }
+            """)
 
         self.load_rom_btn.clicked.connect(self.load_rom)
         self.load_ini_btn.clicked.connect(self.load_ini)
@@ -58,9 +69,16 @@ class PatchTool(QWidget):
         self.feature_list.setFont(QFont("Consolas", 10))
         self.feature_list.setMaximumHeight(250)
         self.feature_list.setStyleSheet("""
-            QListWidget::item { padding: 6px; }
-            QListWidget { font-size: 12px; }
+            QListWidget {
+                font-size: 12px;
+                background-color: #2A2A2A;
+                color: #FFFFFF;
+            }
+            QListWidget::item {
+                padding: 6px;
+            }
         """)
+
         self.feature_list.itemClicked.connect(self.update_bottom_panel_from_list)
         self.feature_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.feature_list.customContextMenuRequested.connect(self.show_context_menu)
@@ -71,7 +89,8 @@ class PatchTool(QWidget):
         self.detail_text.setReadOnly(True)
         self.detail_text.setStyleSheet("""
             QPlainTextEdit {
-                background-color: #F5F5F5;
+                background-color: #1E1E1E;
+                color: #FFFFFF;                    
                 padding: 10px;
                 border: 1px solid #DDD;
             }
@@ -81,7 +100,7 @@ class PatchTool(QWidget):
         self.setLayout(layout)
         self.setStyleSheet(self.styleSheet() + """
             QWidget {
-                background-color: #FAFAFC;
+                background-color: #1E1E1E;
             }
         """)
 
@@ -157,11 +176,11 @@ class PatchTool(QWidget):
             try:
                 current = read_rom_bytes(self.rom_path, patch["offset"], len(patch["modified"]))
                 if current == patch["modified"]:
-                    statuses.append("✅")
+                    statuses.append("✅ mod")
                 elif current == patch["original"]:
-                    statuses.append("🔄")
+                    statuses.append("🔄 og")
                 else:
-                    statuses.append("⚠️")
+                    statuses.append("⚠️ unk")
             except Exception:
                 statuses.append("❌")
         status = max(set(statuses), key=statuses.count)
