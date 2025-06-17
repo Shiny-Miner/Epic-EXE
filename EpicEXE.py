@@ -1,9 +1,8 @@
 import sys
 import os
-import configparser
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog,
-    QListWidget, QListWidgetItem, QLabel, QMenu, QMessageBox
+    QListWidget, QListWidgetItem, QLabel, QMenu, QMessageBox, QPlainTextEdit
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QIcon
@@ -57,6 +56,7 @@ class PatchTool(QWidget):
 
         self.feature_list = QListWidget()
         self.feature_list.setFont(QFont("Consolas", 10))
+        self.feature_list.setMaximumHeight(250)
         self.feature_list.setStyleSheet("""
             QListWidget::item { padding: 6px; }
             QListWidget { font-size: 12px; }
@@ -66,21 +66,19 @@ class PatchTool(QWidget):
         self.feature_list.customContextMenuRequested.connect(self.show_context_menu)
         layout.addWidget(self.feature_list)
 
-        self.detail_text = QLabel("Select a feature to see full info below.")
+        self.detail_text = QPlainTextEdit()
         self.detail_text.setFont(QFont("Courier New", 10))
+        self.detail_text.setReadOnly(True)
         self.detail_text.setStyleSheet("""
-            QLabel {
+            QPlainTextEdit {
                 background-color: #F5F5F5;
                 padding: 10px;
                 border: 1px solid #DDD;
             }
         """)
-        self.detail_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self.detail_text)
 
         self.setLayout(layout)
-
-        # Background color
         self.setStyleSheet(self.styleSheet() + """
             QWidget {
                 background-color: #FAFAFC;
@@ -102,37 +100,76 @@ class PatchTool(QWidget):
         if not path:
             return
 
-        config = configparser.ConfigParser()
-        config.read(path)
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
 
         self.features = []
         self.feature_list.clear()
 
-        for section in config.sections():
+        section_title = None
+        current_feature = {"patches": []}
+
+        for line in lines:
+            if line.startswith("[") and line.endswith("]"):
+                if current_feature["patches"]:
+                    self.features.append(current_feature)
+                    self.add_feature_item(len(self.features) - 1)
+                section_title = line[1:-1]
+                current_feature = {"name": f"Feature {section_title}", "description": "", "patches": []}
+                continue
+
+            if "=" in line:
+                key, val = line.split("=", 1)
+                key = key.strip().lower()
+                val = val.strip()
+
+                if key == "name":
+                    current_feature["name"] = val
+                elif key in ("description", "hackdescription"):
+                    current_feature["description"] = val
+                elif key == "offset":
+                    if "offset" in current_feature:
+                        current_feature["patches"].append({
+                            "offset": current_feature.pop("offset"),
+                            "original": current_feature.pop("original"),
+                            "modified": current_feature.pop("modified")
+                        })
+                    current_feature["offset"] = int(val, 16)
+                elif key == "original":
+                    current_feature["original"] = hex_to_bytes(val)
+                elif key == "modified":
+                    current_feature["modified"] = hex_to_bytes(val)
+
+        if "offset" in current_feature and "original" in current_feature and "modified" in current_feature:
+            current_feature["patches"].append({
+                "offset": current_feature.pop("offset"),
+                "original": current_feature.pop("original"),
+                "modified": current_feature.pop("modified")
+            })
+        if current_feature["patches"]:
+            self.features.append(current_feature)
+            self.add_feature_item(len(self.features) - 1)
+
+    def add_feature_item(self, index):
+        feature = self.features[index]
+        statuses = []
+        for patch in feature["patches"]:
             try:
-                desc = config[section].get("description", "")
-                offset = int(config[section]["offset"], 16)
-                original = hex_to_bytes(config[section]["original"])
-                modified = hex_to_bytes(config[section]["modified"])
-                current = read_rom_bytes(self.rom_path, offset, len(modified))
-
-                status = "✅ Modified" if current == modified else "🔄 Original" if current == original else "⚠️ Unknown"
-                display_line = f"📛 {section} – {desc} [{status}]"
-
-                self.features.append({
-                    "name": section,
-                    "description": desc,
-                    "offset": offset,
-                    "original": original,
-                    "modified": modified
-                })
-
-                item = QListWidgetItem(display_line)
-                item.setFont(QFont("Consolas", 10))
-                item.setData(Qt.UserRole, len(self.features) - 1)
-                self.feature_list.addItem(item)
-            except Exception as e:
-                QMessageBox.critical(self, "INI Parse Error", f"Feature '{section}' is invalid:\n{e}")
+                current = read_rom_bytes(self.rom_path, patch["offset"], len(patch["modified"]))
+                if current == patch["modified"]:
+                    statuses.append("✅")
+                elif current == patch["original"]:
+                    statuses.append("🔄")
+                else:
+                    statuses.append("⚠️")
+            except Exception:
+                statuses.append("❌")
+        status = max(set(statuses), key=statuses.count)
+        display_line = f"📛 {feature['name']} – {feature['description']} [{status}]"
+        item = QListWidgetItem(display_line)
+        item.setFont(QFont("Consolas", 10))
+        item.setData(Qt.UserRole, index)
+        self.feature_list.addItem(item)
 
     def update_bottom_panel_from_list(self, item):
         index = item.data(Qt.UserRole)
@@ -142,26 +179,23 @@ class PatchTool(QWidget):
         if index >= len(self.features):
             return
         feature = self.features[index]
-        try:
-            current = read_rom_bytes(self.rom_path, feature["offset"], len(feature["modified"]))
-            name = feature["name"]
-            desc = feature["description"]
-            offset = feature["offset"]
-            orig = format_bytes(feature["original"])
-            mod = format_bytes(feature["modified"])
-            exe = format_bytes(current)
-
-            self.detail_text.setText(
-                f"📛 Feature: {name}\n"
-                f"📝 Description: {desc}\n"
-                f"🧮 Offset: 0x{offset:06X}\n\n"
-                f"🧾 Original:   {orig}\n"
-                f"🧾 Modified:   {mod}\n"
-                f"🧾 Executable: {exe}"
-            )
-
-        except Exception as e:
-            self.detail_text.setText(f"⚠️ Error reading feature: {e}")
+        text = f"📛 Feature: {feature['name']}\n📝 Description: {feature['description']}\n"
+        for i, patch in enumerate(feature["patches"]):
+            try:
+                current = read_rom_bytes(self.rom_path, patch["offset"], len(patch["modified"]))
+                orig = format_bytes(patch["original"])
+                mod = format_bytes(patch["modified"])
+                exe = format_bytes(current)
+                text += (
+                    f"\n🧮 Patch {i + 1}\n"
+                    f"Offset: 0x{patch['offset']:06X}\n"
+                    f"Original:   {orig}\n"
+                    f"Modified:   {mod}\n"
+                    f"Executable: {exe}\n"
+                )
+            except Exception as e:
+                text += f"\n⚠️ Patch {i + 1} read error: {e}\n"
+        self.detail_text.setPlainText(text)
 
     def show_context_menu(self, pos):
         item = self.feature_list.itemAt(pos)
@@ -172,21 +206,19 @@ class PatchTool(QWidget):
         feature = self.features[index]
 
         menu = QMenu()
-        mod_action = menu.addAction("Set Modified")
-        orig_action = menu.addAction("Set Original")
+        mod_action = menu.addAction("Set All Modified")
+        orig_action = menu.addAction("Set All Original")
 
         action = menu.exec_(self.feature_list.viewport().mapToGlobal(pos))
 
         if action == mod_action:
-            write_rom_bytes(self.rom_path, feature["offset"], feature["modified"])
+            for patch in feature["patches"]:
+                write_rom_bytes(self.rom_path, patch["offset"], patch["modified"])
         elif action == orig_action:
-            write_rom_bytes(self.rom_path, feature["offset"], feature["original"])
+            for patch in feature["patches"]:
+                write_rom_bytes(self.rom_path, patch["offset"], patch["original"])
 
-        # Refresh status line manually
-        current = read_rom_bytes(self.rom_path, feature["offset"], len(feature["modified"]))
-        status = "✅ Modified" if current == feature["modified"] else "🔄 Original" if current == feature["original"] else "⚠️ Unknown"
-        display_line = f"📛 {feature['name']} – {feature['description']} [{status}]"
-        self.feature_list.item(index).setText(display_line)
+        self.add_feature_item(index)  # Refresh status
         self.update_bottom_panel(index)
 
 if __name__ == "__main__":
