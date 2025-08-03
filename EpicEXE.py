@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QIcon
 import json
+import hashlib
 
 
 def except_hook(cls, exception, traceback):
@@ -58,6 +59,7 @@ class PatchTool(QWidget):
         self.resize(750, 600)
 
         self.rom_path = None
+        self.last_ini_path = None
         self.features = []
         self.original_feature_state = {}  # {feature_index: [(offset, bytes), ...]}
 
@@ -126,16 +128,24 @@ class PatchTool(QWidget):
             }
         """)
 
+
     def load_rom(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select ROM", "", "GBA ROMs (*.gba)")
         if path:
+            # 🔁 Reset UI and state
+            self.features = []
+            self.original_feature_state = {}
+            self.feature_list.clear()
+            self.detail_text.clear()
+
             self.rom_path = path
             self.setWindowTitle(f"EpicEXE - {os.path.basename(path)}")
 
-            # Original state file name for this ROM
-            self.state_filename = f"epicexe_original_{os.path.basename(path)}.json"
+            # Generate state filename for this ROM
+            rom_hash = hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:8]
+            self.state_filename = f"epicexe_original_{os.path.basename(path)}_{rom_hash}.json"
 
-            # Load previous original state if available
+            # Try to load previous original state for this ROM
             if os.path.exists(self.state_filename):
                 with open(self.state_filename, "r") as f:
                     raw = json.load(f)
@@ -146,6 +156,9 @@ class PatchTool(QWidget):
             else:
                 self.original_feature_state = {}
 
+            # ✅ If a .ini was previously loaded, apply it to the new ROM
+            if self.last_ini_path and os.path.exists(self.last_ini_path):
+                self.load_ini_from_path(self.last_ini_path)
 
     def load_ini(self):
         if not self.rom_path:
@@ -153,6 +166,7 @@ class PatchTool(QWidget):
             return
 
         path, _ = QFileDialog.getOpenFileName(self, "Select INI File", "", "INI Files (*.ini)")
+        self.last_ini_path = path
         if not path:
             return
 
@@ -164,17 +178,31 @@ class PatchTool(QWidget):
 
         section_title = None
         current_feature = {"patches": []}
-        feature_index = -1  # Track current feature index
+        feature_index = -1
 
         for line in lines:
             if line.startswith("[") and line.endswith("]"):
+                if all(k in current_feature for k in ("offset", "original", "modified")):
+                    patch = {
+                        "offset": current_feature.pop("offset"),
+                        "original": current_feature.pop("original"),
+                        "modified": current_feature.pop("modified")
+                    }
+                    if "hackdescription" in current_feature:
+                        patch["hackdescription"] = current_feature.pop("hackdescription")
+                    current_feature["patches"].append(patch)
+
                 if current_feature["patches"]:
                     self.features.append(current_feature)
                     self.add_feature_item(len(self.features) - 1)
 
                 section_title = line[1:-1]
-                feature_index = len(self.features)  # index before adding
-                current_feature = {"name": f"Feature {section_title}", "description": "", "patches": []}
+                feature_index = len(self.features)
+                current_feature = {
+                    "name": f"Feature {section_title}",
+                    "description": "",
+                    "patches": []
+                }
                 continue
 
             if "=" in line:
@@ -184,22 +212,28 @@ class PatchTool(QWidget):
 
                 if key == "name":
                     current_feature["name"] = val
-                elif key in ("description", "hackdescription"):
+                elif key == "description":
                     current_feature["description"] = val
+                elif key == "warning":
+                    current_feature["warning"] = val
+                elif key == "hackdescription":
+                    current_feature["hackdescription"] = val
                 elif key == "offset":
                     if all(k in current_feature for k in ("offset", "original", "modified")):
-                        current_feature["patches"].append({
+                        patch = {
                             "offset": current_feature.pop("offset"),
                             "original": current_feature.pop("original"),
                             "modified": current_feature.pop("modified")
-                        })
+                        }
+                        if "hackdescription" in current_feature:
+                            patch["hackdescription"] = current_feature.pop("hackdescription")
+                        current_feature["patches"].append(patch)
                     current_feature["offset"] = int(val, 16)
                 elif key == "original":
                     current_feature["original"] = hex_to_bytes(val)
                 elif key == "modified":
                     current_feature["modified"] = hex_to_bytes(val)
 
-                    # Capture original bytes for "Set All Unknown" if not stored yet
                     try:
                         off = current_feature["offset"]
                         length = len(current_feature["modified"])
@@ -211,19 +245,22 @@ class PatchTool(QWidget):
                     except Exception:
                         pass
 
-        # Append last patch if complete
+        # Final flush at end of file
         if all(k in current_feature for k in ("offset", "original", "modified")):
-            current_feature["patches"].append({
+            patch = {
                 "offset": current_feature.pop("offset"),
                 "original": current_feature.pop("original"),
                 "modified": current_feature.pop("modified")
-            })
+            }
+            if "hackdescription" in current_feature:
+                patch["hackdescription"] = current_feature.pop("hackdescription")
+            current_feature["patches"].append(patch)
 
         if current_feature["patches"]:
             self.features.append(current_feature)
             self.add_feature_item(len(self.features) - 1)
 
-        # Save original state to file if it doesn't exist
+        # Save original state for reversion
         if not os.path.exists(self.state_filename):
             save_data = {
                 str(k): [(off, data.hex()) for off, data in v]
@@ -273,6 +310,8 @@ class PatchTool(QWidget):
             return
         feature = self.features[index]
         html = f"<b>📛 Feature:</b> {feature['name']}<br><b>📝 Description:</b> {feature['description']}<br>"
+        if "warning" in feature:
+            html += f"<b>⚠️ Warning:</b> {feature['warning']}<br>"
 
         for i, patch in enumerate(feature["patches"]):
             try:
@@ -289,9 +328,11 @@ class PatchTool(QWidget):
                 else:
                     exe_color = "#FF0000"  # red
 
+                html += f"<br><b>🧮 Patch {i + 1}</b><br>"
+                html += f"Offset: 0x{patch['offset']:06X}<br>"
+                if "hackdescription" in patch:
+                    html += f"<i>🗒️ {patch['hackdescription']}</i><br>"
                 html += (
-                    f"<br><b>🧮 Patch {i + 1}</b><br>"
-                    f"Offset: 0x{patch['offset']:06X}<br>"
                     f"Original:   {orig}<br>"
                     f"Modified:   {mod}<br>"
                     f"<span style='color:{exe_color}'>Executable: {exe}</span><br>"
@@ -333,6 +374,105 @@ class PatchTool(QWidget):
         for i in range(len(self.features)):
             self.add_feature_item(i)
         self.update_bottom_panel(index)
+
+    def load_ini_from_path(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+        self.features = []
+        self.feature_list.clear()
+        self.detail_text.clear()
+
+        section_title = None
+        current_feature = {"patches": []}
+        feature_index = -1
+
+        for line in lines:
+            if line.startswith("[") and line.endswith("]"):
+                if all(k in current_feature for k in ("offset", "original", "modified")):
+                    patch = {
+                        "offset": current_feature.pop("offset"),
+                        "original": current_feature.pop("original"),
+                        "modified": current_feature.pop("modified")
+                    }
+                    if "hackdescription" in current_feature:
+                        patch["hackdescription"] = current_feature.pop("hackdescription")
+                    current_feature["patches"].append(patch)
+
+                if current_feature["patches"]:
+                    self.features.append(current_feature)
+                    self.add_feature_item(len(self.features) - 1)
+
+                section_title = line[1:-1]
+                feature_index = len(self.features)
+                current_feature = {
+                    "name": f"Feature {section_title}",
+                    "description": "",
+                    "patches": []
+                }
+                continue
+
+            if "=" in line:
+                key, val = line.split("=", 1)
+                key = key.strip().lower()
+                val = val.strip()
+
+                if key == "name":
+                    current_feature["name"] = val
+                elif key == "description":
+                    current_feature["description"] = val
+                elif key == "warning":
+                    current_feature["warning"] = val
+                elif key == "hackdescription":
+                    current_feature["hackdescription"] = val
+                elif key == "offset":
+                    if all(k in current_feature for k in ("offset", "original", "modified")):
+                        patch = {
+                            "offset": current_feature.pop("offset"),
+                            "original": current_feature.pop("original"),
+                            "modified": current_feature.pop("modified")
+                        }
+                        if "hackdescription" in current_feature:
+                            patch["hackdescription"] = current_feature.pop("hackdescription")
+                        current_feature["patches"].append(patch)
+                    current_feature["offset"] = int(val, 16)
+                elif key == "original":
+                    current_feature["original"] = hex_to_bytes(val)
+                elif key == "modified":
+                    current_feature["modified"] = hex_to_bytes(val)
+
+                    try:
+                        off = current_feature["offset"]
+                        length = len(current_feature["modified"])
+                        if feature_index not in self.original_feature_state:
+                            self.original_feature_state[feature_index] = []
+                        if not any(o == off for o, _ in self.original_feature_state[feature_index]):
+                            current_bytes = read_rom_bytes(self.rom_path, off, length)
+                            self.original_feature_state[feature_index].append((off, current_bytes))
+                    except Exception:
+                        pass
+
+        if all(k in current_feature for k in ("offset", "original", "modified")):
+            patch = {
+                "offset": current_feature.pop("offset"),
+                "original": current_feature.pop("original"),
+                "modified": current_feature.pop("modified")
+            }
+            if "hackdescription" in current_feature:
+                patch["hackdescription"] = current_feature.pop("hackdescription")
+            current_feature["patches"].append(patch)
+
+        if current_feature["patches"]:
+            self.features.append(current_feature)
+            self.add_feature_item(len(self.features) - 1)
+
+        if not os.path.exists(self.state_filename):
+            save_data = {
+                str(k): [(off, data.hex()) for off, data in v]
+                for k, v in self.original_feature_state.items()
+            }
+            with open(self.state_filename, "w") as f:
+                json.dump(save_data, f, indent=2)
 
 
 if __name__ == "__main__":
