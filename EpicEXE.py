@@ -2,10 +2,12 @@ import sys
 import os
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog,
-    QListWidget, QListWidgetItem, QLabel, QMenu, QMessageBox, QPlainTextEdit
+    QListWidget, QListWidgetItem, QLabel, QMenu, QMessageBox, QPlainTextEdit, QTextEdit
 )
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont, QIcon
+import json
+
 
 def except_hook(cls, exception, traceback):
     with open("error.log", "w") as f:
@@ -30,15 +32,34 @@ def write_rom_bytes(rom_path, offset, data):
 def format_bytes(data):
     return ' '.join(f"{b:02X}" for b in data)
 
+import sys, os
+from PyQt5.QtGui import QIcon
+from PyQt5.QtWidgets import QWidget
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for .py and .exe """
+    if hasattr(sys, '_MEIPASS'):  # Running in PyInstaller bundle
+        return os.path.join(sys._MEIPASS, relative_path)
+    return os.path.join(os.path.abspath("."), relative_path)
+
 class PatchTool(QWidget):
     def __init__(self):
         super().__init__()
+
+        # --- Windows taskbar icon fix ---
+        if sys.platform.startswith("win"):
+            import ctypes
+            myappid = 'EpicEXE.App'  # arbitrary unique ID
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+
+        # --- Title bar + taskbar icon ---
         self.setWindowTitle("EpicEXE - ROM Feature Patcher")
-        self.setWindowIcon(QIcon("epic_icon.ico"))
+        self.setWindowIcon(QIcon(resource_path("exe_icon.ico")))
         self.resize(750, 600)
 
         self.rom_path = None
         self.features = []
+        self.original_feature_state = {}  # {feature_index: [(offset, bytes), ...]}
 
         layout = QVBoxLayout()
 
@@ -84,17 +105,18 @@ class PatchTool(QWidget):
         self.feature_list.customContextMenuRequested.connect(self.show_context_menu)
         layout.addWidget(self.feature_list)
 
-        self.detail_text = QPlainTextEdit()
+        self.detail_text = QTextEdit()
         self.detail_text.setFont(QFont("Courier New", 10))
         self.detail_text.setReadOnly(True)
         self.detail_text.setStyleSheet("""
-            QPlainTextEdit {
+            QTextEdit {
                 background-color: #1E1E1E;
-                color: #FFFFFF;                    
+                color: #FFFFFF;
                 padding: 10px;
                 border: 1px solid #DDD;
             }
         """)
+
         layout.addWidget(self.detail_text)
 
         self.setLayout(layout)
@@ -109,6 +131,21 @@ class PatchTool(QWidget):
         if path:
             self.rom_path = path
             self.setWindowTitle(f"EpicEXE - {os.path.basename(path)}")
+
+            # Original state file name for this ROM
+            self.state_filename = f"epicexe_original_{os.path.basename(path)}.json"
+
+            # Load previous original state if available
+            if os.path.exists(self.state_filename):
+                with open(self.state_filename, "r") as f:
+                    raw = json.load(f)
+                self.original_feature_state = {
+                    int(k): [(off, bytes.fromhex(data)) for off, data in v]
+                    for k, v in raw.items()
+                }
+            else:
+                self.original_feature_state = {}
+
 
     def load_ini(self):
         if not self.rom_path:
@@ -127,13 +164,16 @@ class PatchTool(QWidget):
 
         section_title = None
         current_feature = {"patches": []}
+        feature_index = -1  # Track current feature index
 
         for line in lines:
             if line.startswith("[") and line.endswith("]"):
                 if current_feature["patches"]:
                     self.features.append(current_feature)
                     self.add_feature_item(len(self.features) - 1)
+
                 section_title = line[1:-1]
+                feature_index = len(self.features)  # index before adding
                 current_feature = {"name": f"Feature {section_title}", "description": "", "patches": []}
                 continue
 
@@ -147,7 +187,7 @@ class PatchTool(QWidget):
                 elif key in ("description", "hackdescription"):
                     current_feature["description"] = val
                 elif key == "offset":
-                    if "offset" in current_feature:
+                    if all(k in current_feature for k in ("offset", "original", "modified")):
                         current_feature["patches"].append({
                             "offset": current_feature.pop("offset"),
                             "original": current_feature.pop("original"),
@@ -159,15 +199,39 @@ class PatchTool(QWidget):
                 elif key == "modified":
                     current_feature["modified"] = hex_to_bytes(val)
 
-        if "offset" in current_feature and "original" in current_feature and "modified" in current_feature:
+                    # Capture original bytes for "Set All Unknown" if not stored yet
+                    try:
+                        off = current_feature["offset"]
+                        length = len(current_feature["modified"])
+                        if feature_index not in self.original_feature_state:
+                            self.original_feature_state[feature_index] = []
+                        if not any(o == off for o, _ in self.original_feature_state[feature_index]):
+                            current_bytes = read_rom_bytes(self.rom_path, off, length)
+                            self.original_feature_state[feature_index].append((off, current_bytes))
+                    except Exception:
+                        pass
+
+        # Append last patch if complete
+        if all(k in current_feature for k in ("offset", "original", "modified")):
             current_feature["patches"].append({
                 "offset": current_feature.pop("offset"),
                 "original": current_feature.pop("original"),
                 "modified": current_feature.pop("modified")
             })
+
         if current_feature["patches"]:
             self.features.append(current_feature)
             self.add_feature_item(len(self.features) - 1)
+
+        # Save original state to file if it doesn't exist
+        if not os.path.exists(self.state_filename):
+            save_data = {
+                str(k): [(off, data.hex()) for off, data in v]
+                for k, v in self.original_feature_state.items()
+            }
+            with open(self.state_filename, "w") as f:
+                json.dump(save_data, f, indent=2)
+
 
     def add_feature_item(self, index):
         feature = self.features[index]
@@ -176,18 +240,28 @@ class PatchTool(QWidget):
             try:
                 current = read_rom_bytes(self.rom_path, patch["offset"], len(patch["modified"]))
                 if current == patch["modified"]:
-                    statuses.append("✅ mod")
+                    statuses.append("mod")
                 elif current == patch["original"]:
-                    statuses.append("🔄 og")
+                    statuses.append("og")
                 else:
-                    statuses.append("⚠️ unk")
+                    statuses.append("unk")
             except Exception:
-                statuses.append("❌")
+                statuses.append("err")
+
         status = max(set(statuses), key=statuses.count)
         display_line = f"📛 {feature['name']} – {feature['description']} [{status}]"
         item = QListWidgetItem(display_line)
         item.setFont(QFont("Consolas", 10))
         item.setData(Qt.UserRole, index)
+
+        # Color mapping
+        if status == "mod":
+            item.setForeground(Qt.green)
+        elif status == "unk":
+            item.setForeground(Qt.red)
+        else:  # original or err
+            item.setForeground(Qt.white)
+
         self.feature_list.addItem(item)
 
     def update_bottom_panel_from_list(self, item):
@@ -198,23 +272,35 @@ class PatchTool(QWidget):
         if index >= len(self.features):
             return
         feature = self.features[index]
-        text = f"📛 Feature: {feature['name']}\n📝 Description: {feature['description']}\n"
+        html = f"<b>📛 Feature:</b> {feature['name']}<br><b>📝 Description:</b> {feature['description']}<br>"
+
         for i, patch in enumerate(feature["patches"]):
             try:
                 current = read_rom_bytes(self.rom_path, patch["offset"], len(patch["modified"]))
                 orig = format_bytes(patch["original"])
                 mod = format_bytes(patch["modified"])
                 exe = format_bytes(current)
-                text += (
-                    f"\n🧮 Patch {i + 1}\n"
-                    f"Offset: 0x{patch['offset']:06X}\n"
-                    f"Original:   {orig}\n"
-                    f"Modified:   {mod}\n"
-                    f"Executable: {exe}\n"
+
+                # Determine executable color
+                if current == patch["modified"]:
+                    exe_color = "#00FF00"  # green
+                elif current == patch["original"]:
+                    exe_color = "#FFFFFF"  # white
+                else:
+                    exe_color = "#FF0000"  # red
+
+                html += (
+                    f"<br><b>🧮 Patch {i + 1}</b><br>"
+                    f"Offset: 0x{patch['offset']:06X}<br>"
+                    f"Original:   {orig}<br>"
+                    f"Modified:   {mod}<br>"
+                    f"<span style='color:{exe_color}'>Executable: {exe}</span><br>"
                 )
             except Exception as e:
-                text += f"\n⚠️ Patch {i + 1} read error: {e}\n"
-        self.detail_text.setPlainText(text)
+                html += f"<br>⚠️ Patch {i + 1} read error: {e}<br>"
+
+        self.detail_text.setHtml(html)
+
 
     def show_context_menu(self, pos):
         item = self.feature_list.itemAt(pos)
@@ -227,6 +313,7 @@ class PatchTool(QWidget):
         menu = QMenu()
         mod_action = menu.addAction("Set All Modified")
         orig_action = menu.addAction("Set All Original")
+        unk_action = menu.addAction("Set All Unknown")  # New option
 
         action = menu.exec_(self.feature_list.viewport().mapToGlobal(pos))
 
@@ -236,9 +323,17 @@ class PatchTool(QWidget):
         elif action == orig_action:
             for patch in feature["patches"]:
                 write_rom_bytes(self.rom_path, patch["offset"], patch["original"])
+        elif action == unk_action:
+            if index in self.original_feature_state:
+                for off, data in self.original_feature_state[index]:
+                    write_rom_bytes(self.rom_path, off, data)
 
-        self.add_feature_item(index)  # Refresh status
+        # Refresh full list and details
+        self.feature_list.clear()
+        for i in range(len(self.features)):
+            self.add_feature_item(i)
         self.update_bottom_panel(index)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
